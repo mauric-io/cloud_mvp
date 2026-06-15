@@ -1,321 +1,199 @@
+from __future__ import annotations
+
 import json
-from datetime import date, timedelta
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
-from supabase import create_client
 
 
-APP_ROOT = Path(__file__).resolve().parent
-TAXONOMY_PATH = APP_ROOT.parent / "config" / "taxonomy_v1.json"
+APP_ROOT = Path(__file__).resolve().parents[1]
+DATA_ROOT = APP_ROOT / "data"
+DATES_ROOT = DATA_ROOT / "daily_selector_dates"
 
 
 st.set_page_config(
-    page_title="Briefing Builder MVP",
-    page_icon="🧭",
+    page_title="Selector briefing cloud MVP",
     layout="wide",
 )
 
 
-@st.cache_data
-def load_taxonomy():
-    with open(TAXONOMY_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+def load_csv(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        st.error(f"Falta archivo: {path.relative_to(APP_ROOT)}")
+        st.stop()
+    return pd.read_csv(path)
 
 
-@st.cache_resource
-def get_supabase():
-    url = st.secrets.get("SUPABASE_URL", "")
-    key = st.secrets.get("SUPABASE_KEY", "")
-    bad_url = (
-        not url
-        or "YOUR_PROJECT" in url
-        or "xxxxxxxx" in url
-        or not url.startswith("https://")
-        or not url.endswith(".supabase.co")
-    )
-    bad_key = (
-        not key
-        or "YOUR_SUPABASE" in key
-        or "your-real-key" in key
-    )
-    if bad_url or bad_key:
-        return None
-    return create_client(url, key)
+def available_dates() -> list[str]:
+    if not DATES_ROOT.exists():
+        st.error(f"No existe: {DATES_ROOT.relative_to(APP_ROOT)}")
+        st.stop()
+
+    dates = []
+    for p in DATES_ROOT.iterdir():
+        if p.is_dir() and (p / "daily_ranked_articles.csv").exists():
+            dates.append(p.name)
+
+    dates = sorted(dates)
+    if not dates:
+        st.error("No hay fechas selector cargadas en data/daily_selector_dates/")
+        st.stop()
+    return dates
 
 
-def as_list(value):
-    if value is None:
-        return []
-    if isinstance(value, list):
-        return [str(x).strip() for x in value if str(x).strip()]
-    if isinstance(value, str):
-        try:
-            parsed = json.loads(value)
-            if isinstance(parsed, list):
-                return [str(x).strip() for x in parsed if str(x).strip()]
-            if isinstance(parsed, dict):
-                return []
-        except Exception:
-            return [value.strip()] if value.strip() else []
-    return []
+def run_dir(run_date: str) -> Path:
+    return DATES_ROOT / run_date
 
 
-def as_dict(value):
-    if value is None:
-        return {}
-    if isinstance(value, dict):
-        return value
-    if isinstance(value, str):
-        try:
-            parsed = json.loads(value)
-            return parsed if isinstance(parsed, dict) else {}
-        except Exception:
-            return {}
-    return {}
-
-
-def merge_tag_values(row, keys):
-    py_tags = as_dict(row.get("py_tags"))
-    flash_tags = as_dict(row.get("flash_tags"))
-    values = []
-    for source in (py_tags, flash_tags):
-        for key in keys:
-            values.extend(as_list(source.get(key)))
-    return sorted(set(v for v in values if v))
-
-
-def fetch_articles(sb, product, date_from, date_to):
-    if sb is None:
-        local_path = APP_ROOT.parent / "data" / "local_articles.csv"
-        if not local_path.exists():
-            return pd.DataFrame()
-        df = pd.read_csv(local_path)
-        if "article_date" in df.columns:
-            parsed_dates = pd.to_datetime(df["article_date"], format="mixed", errors="coerce")
-            if parsed_dates.isna().any() and "run_date" in df.columns:
-                fallback_dates = pd.to_datetime(df["run_date"], format="mixed", errors="coerce")
-                parsed_dates = parsed_dates.fillna(fallback_dates)
-            df["article_date"] = parsed_dates.dt.date
-            df = df[df["article_date"].notna()]
-            df = df[(df["article_date"] >= date_from) & (df["article_date"] <= date_to)]
-        if "product" in df.columns:
-            df = df[df["product"] == product]
-        return df
-
-    response = (
-        sb.table("articles")
-        .select("*")
-        .eq("product", product)
-        .gte("article_date", str(date_from))
-        .lte("article_date", str(date_to))
-        .limit(5000)
-        .execute()
-    )
-    rows = response.data or []
-    return pd.DataFrame(rows)
-
-
-def row_matches(row, selected, keys):
-    if not selected:
-        return True
-    values = set(merge_tag_values(row, keys))
-    return bool(values.intersection(set(selected)))
-
-
-def get_relevance(row):
-    val = row.get("relevance_score")
-    if val is None:
-        flash_tags = as_dict(row.get("flash_tags"))
-        val = flash_tags.get("briefing_relevance", 0)
+def load_manifest(run_date: str) -> dict:
+    p = run_dir(run_date) / "manifest.json"
+    if not p.exists():
+        return {"run_date": run_date, "manifest_status": "missing"}
     try:
-        return float(val or 0)
-    except Exception:
-        return 0.0
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception as e:
+        return {"run_date": run_date, "manifest_status": f"bad json: {e}"}
 
 
-def build_packet(df, product, date_from, date_to, selected_summary):
-    lines = []
-    lines.append(f"# Analyzer packet — {product}")
-    lines.append("")
-    lines.append(f"Date range: {date_from} to {date_to}")
-    lines.append("")
-    lines.append("## User selection")
-    for key, value in selected_summary.items():
-        lines.append(f"- {key}: {', '.join(value) if value else 'All'}")
-    lines.append("")
-    lines.append("## Candidate items")
-    lines.append("")
+def payload_summary(run_date: str) -> dict:
+    rdir = run_dir(run_date)
+    ranked = load_csv(rdir / "daily_ranked_articles.csv")
+    clusters = load_csv(rdir / "daily_issue_clusters.csv")
 
-    for i, row in df.head(80).iterrows():
-        flash_tags = as_dict(row.get("flash_tags"))
-        py_tags = as_dict(row.get("py_tags"))
+    out = {
+        "date": run_date,
+        "total_rows": len(ranked),
+        "unique_urls": ranked["url"].nunique() if "url" in ranked.columns else None,
+        "clusters": len(clusters),
+        "nacional": 0,
+        "biz": 0,
+        "regiones": 0,
+        "manifest": "ok" if (rdir / "manifest.json").exists() else "missing",
+    }
 
-        lines.append(f"### {row.get('title', '').strip()}")
-        lines.append("")
-        lines.append(f"- Date: {row.get('article_date', '')}")
-        lines.append(f"- Outlet: {row.get('outlet', '')}")
-        lines.append(f"- URL: {row.get('url', '')}")
-        lines.append(f"- Relevance: {get_relevance(row)}")
-        lines.append(f"- Temas: {', '.join(merge_tag_values(row, ['temas', 'themes', 'user_topics']))}")
-        lines.append(f"- Empresas / sectores: {', '.join(merge_tag_values(row, ['empresas_sectores', 'companies_or_sectors', 'companies', 'sectors']))}")
-        lines.append(f"- Entidades: {', '.join(merge_tag_values(row, ['entidades', 'entities']))}")
-        lines.append(f"- Regiones: {', '.join(merge_tag_values(row, ['regiones', 'regions', 'geography']))}")
-        why = flash_tags.get("why_relevant") or py_tags.get("why_relevant") or ""
-        if why:
-            lines.append(f"- Why relevant: {why}")
-        lines.append("")
+    if "product" in ranked.columns:
+        vc = ranked["product"].fillna("UNKNOWN").astype(str).str.lower().value_counts()
+        out["nacional"] = int(vc.get("nacional", 0))
+        out["biz"] = int(vc.get("biz", 0))
+        out["regiones"] = int(vc.get("regiones", 0))
 
-    return "\n".join(lines)
+    return out
 
 
-taxonomy = load_taxonomy()
-sb = get_supabase()
-
-st.title("Construye tu briefing")
-st.caption("MVP cloud — controles simples para usuario; etiquetas internas quedan guardadas para ranking/análisis.")
-
-if sb is None:
-    st.info("Modo local: Supabase todavía no está configurado. La app leerá `cloud_mvp/data/local_articles.csv` si existe.")
-
-col_a, col_b, col_c = st.columns([1, 1, 1])
-
-with col_a:
-    product = st.selectbox("Producto", ["nacional", "biz", "regiones"], index=0)
-
-with col_b:
-    default_to = date.today()
-    default_from = default_to - timedelta(days=2)
-    date_from = st.date_input("Desde", value=default_from)
-
-with col_c:
-    date_to = st.date_input("Hasta", value=default_to)
-
-if date_from > date_to:
-    st.error("La fecha inicial no puede ser posterior a la fecha final.")
-    st.stop()
-
-df = fetch_articles(sb, product, date_from, date_to)
-
-if df.empty:
-    st.warning("No hay artículos cargados para ese producto/rango. En modo local, falta crear `cloud_mvp/data/local_articles.csv` desde tus dos días reales.")
-    st.stop()
-
-for col in ["py_tags", "flash_tags"]:
-    if col not in df.columns:
-        df[col] = [{}]
-
-df["relevance_num"] = df.apply(get_relevance, axis=1)
-
-st.subheader("Filtros principales")
-
-c1, c2 = st.columns(2)
-
-with c1:
-    selected_temas = st.multiselect("Temas", taxonomy["temas"])
-    selected_empresas_sectores = st.multiselect("Empresas / sectores", taxonomy["empresas_sectores"])
-
-with c2:
-    selected_entidades = st.multiselect("Entidades", taxonomy["entidades"])
-    selected_regiones = st.multiselect("Regiones", taxonomy["regiones"])
-
-relevance_mode = st.radio(
-    "Modo",
-    ["Amplio", "Priorizar lo más relevante", "Solo señales fuertes"],
-    horizontal=True,
-    index=0,
-)
-
-show_advanced = bool(st.secrets.get("SHOW_ADVANCED_FILTERS", False))
-
-selected_sources = []
-selected_story_types = []
-selected_risk_flags = []
-selected_opportunity_flags = []
-
-if show_advanced:
-    with st.expander("Filtros avanzados / internos", expanded=False):
-        available_sources = sorted(df["outlet"].dropna().astype(str).unique().tolist()) if "outlet" in df else []
-        selected_sources = st.multiselect("Fuentes", available_sources)
-        selected_story_types = st.multiselect("Tipo interno de hecho", taxonomy["internal_story_types"])
-        selected_risk_flags = st.multiselect("Riesgos internos", taxonomy["internal_risk_flags"])
-        selected_opportunity_flags = st.multiselect("Oportunidades internas", taxonomy["internal_opportunity_flags"])
-
-filtered = df.copy()
-
-filtered = filtered[
-    filtered.apply(lambda r: row_matches(r, selected_temas, ["temas", "themes", "user_topics"]), axis=1)
-]
-
-filtered = filtered[
-    filtered.apply(lambda r: row_matches(r, selected_empresas_sectores, ["empresas_sectores", "companies_or_sectors", "companies", "sectors"]), axis=1)
-]
-
-filtered = filtered[
-    filtered.apply(lambda r: row_matches(r, selected_entidades, ["entidades", "entities"]), axis=1)
-]
-
-filtered = filtered[
-    filtered.apply(lambda r: row_matches(r, selected_regiones, ["regiones", "regions", "geography"]), axis=1)
-]
-
-if selected_sources and "outlet" in filtered.columns:
-    filtered = filtered[filtered["outlet"].isin(selected_sources)]
-
-if selected_story_types:
-    filtered = filtered[
-        filtered.apply(lambda r: row_matches(r, selected_story_types, ["internal_story_type", "story_type"]), axis=1)
+def validate_payload(run_date: str) -> None:
+    rdir = run_dir(run_date)
+    required = [
+        "daily_ranked_articles.csv",
+        "daily_issue_clusters.csv",
+        "manifest.json",
     ]
 
-if selected_risk_flags:
-    filtered = filtered[
-        filtered.apply(lambda r: row_matches(r, selected_risk_flags, ["internal_risk_flags", "risk_flags"]), axis=1)
-    ]
+    missing = [f for f in required if not (rdir / f).exists()]
+    if missing:
+        st.error(f"Payload incompleto para {run_date}. Faltan: {', '.join(missing)}")
+        st.stop()
 
-if selected_opportunity_flags:
-    filtered = filtered[
-        filtered.apply(lambda r: row_matches(r, selected_opportunity_flags, ["internal_opportunity_flags", "opportunity_flags"]), axis=1)
-    ]
+    ranked = load_csv(rdir / "daily_ranked_articles.csv")
+    if "url" not in ranked.columns:
+        st.error(f"Payload inválido para {run_date}: falta columna url")
+        st.stop()
 
-if relevance_mode == "Solo señales fuertes":
-    filtered = filtered[filtered["relevance_num"] >= 4]
+    if ranked["url"].dropna().astype(str).nunique() == 0:
+        st.error(f"Payload inválido para {run_date}: URL set vacío")
+        st.stop()
 
-if relevance_mode in ["Priorizar lo más relevante", "Solo señales fuertes"]:
-    filtered = filtered.sort_values("relevance_num", ascending=False)
+    manifest = load_manifest(run_date)
+    manifest_date = (
+        manifest.get("run_date")
+        or manifest.get("date")
+        or manifest.get("payload_date")
+    )
+    if manifest_date and str(manifest_date) != run_date:
+        st.error(
+            f"Manifest inválido: carpeta {run_date}, manifest dice {manifest_date}"
+        )
+        st.stop()
 
-st.divider()
 
-m1, m2, m3 = st.columns(3)
-m1.metric("Artículos cargados", len(df))
-m2.metric("Artículos seleccionados", len(filtered))
-m3.metric("Relevancia media", round(float(filtered["relevance_num"].mean()), 2) if not filtered.empty else 0)
+st.title("Selector briefing cloud MVP")
+st.caption("Lee payloads fechados desde data/daily_selector_dates/. No usa local_articles.csv.")
 
-preview_cols = [c for c in ["article_date", "outlet", "title", "relevance_num", "url"] if c in filtered.columns]
+dates = available_dates()
+summary_df = pd.DataFrame([payload_summary(d) for d in dates])
 
-st.subheader("Vista previa")
-st.dataframe(
-    filtered[preview_cols].head(100),
-    use_container_width=True,
-    hide_index=True,
-)
+st.subheader("Payloads disponibles")
+st.dataframe(summary_df, use_container_width=True, hide_index=True)
 
-selected_summary = {
-    "Temas": selected_temas,
-    "Empresas / sectores": selected_empresas_sectores,
-    "Entidades": selected_entidades,
-    "Regiones": selected_regiones,
-}
+default_idx = len(dates) - 1
+selected_date = st.selectbox("Fecha", dates, index=default_idx)
 
-packet_text = build_packet(filtered, product, date_from, date_to, selected_summary)
+validate_payload(selected_date)
 
-st.subheader("Packet")
-st.download_button(
-    "Descargar analyzer packet .md",
-    data=packet_text,
-    file_name=f"{product}_{date_from}_{date_to}_analyzer_packet.md",
-    mime="text/markdown",
-)
+rdir = run_dir(selected_date)
+ranked = load_csv(rdir / "daily_ranked_articles.csv")
+clusters = load_csv(rdir / "daily_issue_clusters.csv")
+manifest = load_manifest(selected_date)
 
-with st.expander("Ver packet", expanded=False):
-    st.text_area("Packet generado", packet_text, height=420)
+st.subheader(f"Detalle selector — {selected_date}")
+
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Artículos", len(ranked))
+c2.metric("URLs únicas", ranked["url"].nunique() if "url" in ranked.columns else 0)
+c3.metric("Clusters", len(clusters))
+c4.metric("Manifest", "ok" if (rdir / "manifest.json").exists() else "missing")
+
+if "product" in ranked.columns:
+    products = ["todos"] + sorted(ranked["product"].dropna().astype(str).unique().tolist())
+    product = st.selectbox("Producto", products)
+    if product != "todos":
+        ranked_view = ranked[ranked["product"].astype(str) == product].copy()
+    else:
+        ranked_view = ranked.copy()
+else:
+    ranked_view = ranked.copy()
+
+st.write(f"Mostrando {len(ranked_view)} artículos")
+
+preferred_cols = [
+    "product",
+    "rank",
+    "rank_score",
+    "outlet",
+    "source",
+    "title",
+    "url",
+    "cluster_id",
+    "issue",
+    "category",
+    "date",
+]
+
+cols = [c for c in preferred_cols if c in ranked_view.columns]
+if not cols:
+    cols = ranked_view.columns.tolist()
+
+st.dataframe(ranked_view[cols], use_container_width=True, hide_index=True)
+
+with st.expander("Clusters"):
+    st.dataframe(clusters, use_container_width=True, hide_index=True)
+
+with st.expander("Manifest"):
+    st.json(manifest)
+
+packet = rdir / "daily_llm_candidate_packet.md"
+report = rdir / "daily_selector_report.md"
+
+d1, d2 = st.columns(2)
+if packet.exists():
+    d1.download_button(
+        "Descargar packet LLM",
+        packet.read_text(encoding="utf-8"),
+        file_name=f"{selected_date}_daily_llm_candidate_packet.md",
+    )
+if report.exists():
+    d2.download_button(
+        "Descargar reporte selector",
+        report.read_text(encoding="utf-8"),
+        file_name=f"{selected_date}_daily_selector_report.md",
+    )
