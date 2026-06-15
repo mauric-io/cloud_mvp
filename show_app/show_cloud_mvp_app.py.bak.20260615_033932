@@ -92,11 +92,6 @@ def fetch_articles(sb, product, date_from, date_to):
         if not local_path.exists():
             return pd.DataFrame()
         df = pd.read_csv(local_path)
-        if "article_date" not in df.columns:
-            for _date_col in ["date", "run_date", "source_date"]:
-                if _date_col in df.columns:
-                    df["article_date"] = df[_date_col]
-                    break
         if "article_date" in df.columns:
             parsed_dates = pd.to_datetime(df["article_date"], format="mixed", errors="coerce")
             if parsed_dates.isna().any() and "run_date" in df.columns:
