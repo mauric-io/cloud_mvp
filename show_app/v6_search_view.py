@@ -685,7 +685,7 @@ def render_v6_search_briefing_app() -> None:
 
     with left:
         st.subheader("Artículos")
-        visible_source = f.copy().reset_index(drop=True)
+        visible_source = f.head(1000).copy().reset_index(drop=True)
         table = pd.DataFrame(
             {
                 "Usar": [True] * len(visible_source),
